@@ -9,7 +9,10 @@ const {
     EmbedBuilder
 } = require("discord.js");
 
+const fs = require("fs");
 const auth = require("./auth.json");
+
+const DATA_FILE = "./events.json";
 
 const client = new Client({
     intents: [
@@ -23,6 +26,52 @@ const client = new Client({
 const ticketStates = {};
 const rsvpData = {};
 const eventStore = {};
+
+// automatic save/load (Michellle N)
+function saveData() {
+    fs.writeFileSync(DATA_FILE, JSON.stringify({
+        rsvpData,
+        eventStore
+    }, null, 4));
+}
+
+function loadData() {
+    if (!fs.existsSync(DATA_FILE)) return;
+
+    const data = JSON.parse(fs.readFileSync(DATA_FILE));
+
+    Object.assign(rsvpData, data.rsvpData || {});
+    Object.assign(eventStore, data.eventStore || {});
+}
+
+// validation helpers (Michelle N)
+function validEmail(email) {
+    return email.includes("@") && email.includes(".");
+}
+
+function validDate(date) {
+    return /^\d{2}-\d{2}-\d{4}$/.test(date);
+}
+
+function validTime(time) {
+    return /^\d{2}:\d{2}\s?(AM|PM|am|pm)$/.test(time);
+}
+
+function validUser(user) {
+    return /^[a-zA-Z0-9._-]+$/.test(user);
+}
+
+function validPass(pass) {
+    return pass.length >= 5;
+}
+
+function validName(name) {
+    return /^[a-zA-Z]+$/.test(name);
+}
+
+function validURL(url) {
+    return /^https?:\/\/.+/.test(url);
+}
 
 // helper stuff
 function cleanName(str) {
@@ -50,6 +99,20 @@ function getChannel(guild, name) {
 
 function getCloseRow() {
     return new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId("close_ticket")
+            .setLabel("Close Ticket")
+            .setStyle(ButtonStyle.Danger)
+    );
+}
+
+function getBackRow() {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId("back")
+            .setLabel("Back")
+            .setStyle(ButtonStyle.Secondary),
+
         new ButtonBuilder()
             .setCustomId("close_ticket")
             .setLabel("Close Ticket")
@@ -261,6 +324,8 @@ async function makeTicket(guild, member, devRole, type) {
 client.once("clientReady", async () => {
     console.log("Bot Ready");
 
+    loadData();
+
     const guild = client.guilds.cache.first();
     if (!guild) return;
 
@@ -296,8 +361,23 @@ client.once("clientReady", async () => {
         const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder()
                 .setCustomId("create_event")
-                .setLabel("Create Event")
-                .setStyle(ButtonStyle.Success)
+                .setLabel("Add Event")
+                .setStyle(ButtonStyle.Success),
+
+            new ButtonBuilder()
+                .setCustomId("view_events")
+                .setLabel("View Events")
+                .setStyle(ButtonStyle.Primary),
+
+            new ButtonBuilder()
+                .setCustomId("search_events")
+                .setLabel("Search Events")
+                .setStyle(ButtonStyle.Secondary),
+
+            new ButtonBuilder()
+                .setCustomId("delete_event")
+                .setLabel("Delete Event")
+                .setStyle(ButtonStyle.Danger)
         );
 
         const msg = await eventChannel.send({
@@ -351,6 +431,8 @@ client.on("interactionCreate", async (interaction) => {
             rsvpData[eventId] = rsvpData[eventId].filter(id => id !== member.id);
         }
 
+        saveData();
+
         return interaction.update({
             components: [buildRsvpRow(eventId)]
         });
@@ -358,12 +440,83 @@ client.on("interactionCreate", async (interaction) => {
 
     await interaction.deferReply({ ephemeral: true });
 
+    // back button (Michelle N)
+    if (interaction.customId === "back") {
+        const state = ticketStates[interaction.channel.id];
+        if (!state) return interaction.editReply("Nothing to go back to.");
+
+        if (state.type === "event") {
+            state.step = "title";
+            return interaction.editReply("Back to beginning. Enter EVENT TITLE.");
+        }
+
+        if (state.type === "verify") {
+            state.step = "admin_check";
+            return interaction.editReply("Back to verification start.");
+        }
+
+        if (state.type === "apply") {
+            state.step = "admin_check";
+            return interaction.editReply("Back to application start.");
+        }
+
+        if (state.type === "search" || state.type === "delete") {
+            delete ticketStates[interaction.channel.id];
+            return interaction.editReply("Back to main menu.");
+        }
+    }
+
     // close ticket
     if (interaction.customId === "close_ticket") {
         await cleanTicket(guild, interaction.channel);
 
         await interaction.editReply("closed");
         return;
+    }
+
+    // view events (Michelle N)
+    if (interaction.customId === "view_events") {
+        const events = Object.entries(eventStore);
+
+        if (!events.length) {
+            return interaction.editReply("No events found.");
+        }
+
+        let text = "**Current Events:**\n\n";
+
+        for (const [id, event] of events) {
+            text += `ID: ${id}\n`;
+            text += `Title: ${event.title}\n`;
+            text += `Ended: ${event.ended ? "Yes" : "No"}\n\n`;
+        }
+
+        return interaction.editReply(text);
+    }
+
+    // search events (Michelle N)
+    if (interaction.customId === "search_events") {
+        ticketStates[interaction.channel.id] = {
+            type: "search",
+            step: "keyword",
+            userId: interaction.user.id
+        };
+
+        return interaction.editReply("Enter a keyword to search for an event.");
+    }
+
+    // delete event (Michelle N)
+    if (interaction.customId === "delete_event") {
+        if (!managerRole || !member.roles.cache.has(managerRole.id)) {
+            return interaction.editReply("Only Event Managers can delete events.");
+        }
+
+        ticketStates[interaction.channel.id] = {
+            type: "delete",
+            step: "event_id",
+            userId: interaction.user.id
+        };
+
+        return interaction.editReply("Enter the event ID you want to delete.");
     }
 
     // admin yes no
@@ -444,7 +597,12 @@ client.on("interactionCreate", async (interaction) => {
             new ButtonBuilder()
                 .setCustomId(`restart_event_${interaction.channel.id}`)
                 .setLabel("Restart")
-                .setStyle(ButtonStyle.Danger)
+                .setStyle(ButtonStyle.Danger),
+
+            new ButtonBuilder()
+                .setCustomId("back")
+                .setLabel("Back")
+                .setStyle(ButtonStyle.Secondary)
         );
 
         state.step = "confirm";
@@ -474,7 +632,7 @@ client.on("interactionCreate", async (interaction) => {
 
         await ticket.channel.send({
             content: "Do you have an admin pass?",
-            components: [yesNoRow("verify_admin"), getCloseRow()]
+            components: [yesNoRow("verify_admin"), getBackRow()]
         });
 
         return interaction.editReply(`check ${ticket.channel}`);
@@ -497,7 +655,7 @@ client.on("interactionCreate", async (interaction) => {
 
         await ticket.channel.send({
             content: "Do you have an admin pass?",
-            components: [yesNoRow("apply_admin"), getCloseRow()]
+            components: [yesNoRow("apply_admin"), getBackRow()]
         });
 
         return interaction.editReply(`check ${ticket.channel}`);
@@ -524,7 +682,7 @@ client.on("interactionCreate", async (interaction) => {
 
         await ticket.channel.send({
             content: "Enter EVENT TITLE",
-            components: [getCloseRow()]
+            components: [getBackRow()]
         });
 
         return interaction.editReply(`check ${ticket.channel}`);
@@ -606,6 +764,13 @@ client.on("interactionCreate", async (interaction) => {
 
         eventStore[eventId] = {
             title: state.title,
+            date: state.date,
+            start: state.start,
+            end: state.end,
+            location: state.location,
+            details: state.details,
+            online: state.online,
+            flyer: state.flyer,
             messageId: sent.id,
             channelId: announcements.id,
             qnaId: qna.id,
@@ -615,6 +780,8 @@ client.on("interactionCreate", async (interaction) => {
             started: false,
             ended: false
         };
+
+        saveData();
 
         await cleanTicket(guild, interaction.channel);
 
@@ -651,10 +818,61 @@ client.on("messageCreate", async (msg) => {
     if (!state) return;
     if (msg.author.id !== state.userId) return;
 
+    // search flow (Michelle N)
+    if (state.type === "search") {
+        if (state.step === "keyword") {
+            const keyword = msg.content.toLowerCase();
+
+            const results = Object.entries(eventStore).filter(([id, event]) =>
+                event.title.toLowerCase().includes(keyword) ||
+                event.details?.toLowerCase().includes(keyword) ||
+                event.location?.toLowerCase().includes(keyword)
+            );
+
+            if (!results.length) {
+                return msg.reply("No matching events found.");
+            }
+
+            let text = "**Search Results:**\n\n";
+
+            for (const [id, event] of results) {
+                text += `ID: ${id}\n`;
+                text += `Title: ${event.title}\n`;
+                text += `Date: ${event.date}\n`;
+                text += `Time: ${event.start} - ${event.end}\n`;
+                text += `Location: ${event.location}\n\n`;
+            }
+
+            return msg.reply(text);
+        }
+    }
+
+    // delete flow (Michelle N)
+    if (state.type === "delete") {
+        if (state.step === "event_id") {
+            const eventId = msg.content.trim();
+
+            if (!eventStore[eventId]) {
+                return msg.reply("Event not found.");
+            }
+
+            delete eventStore[eventId];
+            delete rsvpData[eventId];
+
+            saveData();
+
+            return msg.reply("Event deleted successfully.");
+        }
+    }
+
     // verify flow
     if (state.type === "verify") {
         if (state.step === "admin_code") {
-            if (msg.content === "1234") {
+            if (!validPass(msg.content)) {
+                return msg.reply("Admin pass must be at least 5 characters.");
+            }
+
+            if (msg.content === "12345") {
                 const verifiedRole = msg.guild.roles.cache.find(r => r.name === "Authenticated");
                 const member = await msg.guild.members.fetch(msg.author.id);
 
@@ -670,18 +888,30 @@ client.on("messageCreate", async (msg) => {
         }
 
         if (state.step === "first") {
+            if (!validName(msg.content)) {
+                return msg.reply("First name must contain letters only.");
+            }
+
             state.first = msg.content;
             state.step = "last";
             return msg.reply("enter LAST name");
         }
 
         if (state.step === "last") {
+            if (!validName(msg.content)) {
+                return msg.reply("Last name must contain letters only.");
+            }
+
             state.last = msg.content.toLowerCase();
             state.step = "username";
             return msg.reply("enter SCHOOL username");
         }
 
         if (state.step === "username") {
+            if (!validUser(msg.content)) {
+                return msg.reply("Invalid username. Use letters, numbers, dots, underscores, or dashes only.");
+            }
+
             const username = msg.content.toLowerCase();
 
             if (!username.includes(state.last)) {
@@ -697,6 +927,10 @@ client.on("messageCreate", async (msg) => {
         }
 
         if (state.step === "email") {
+            if (!validEmail(msg.content)) {
+                return msg.reply("Invalid email. Email must include @ and .");
+            }
+
             state.email = msg.content;
 
             const verifiedRole = msg.guild.roles.cache.find(r => r.name === "Authenticated");
@@ -714,7 +948,11 @@ client.on("messageCreate", async (msg) => {
     // apply flow
     if (state.type === "apply") {
         if (state.step === "admin_code") {
-            if (msg.content === "1234") {
+            if (!validPass(msg.content)) {
+                return msg.reply("Admin pass must be at least 5 characters.");
+            }
+
+            if (msg.content === "12345") {
                 const managerRole = msg.guild.roles.cache.find(r => r.name === "Event Manager");
                 const member = await msg.guild.members.fetch(msg.author.id);
 
@@ -736,6 +974,10 @@ client.on("messageCreate", async (msg) => {
         }
 
         if (state.step === "email") {
+            if (!validEmail(msg.content)) {
+                return msg.reply("Invalid email. Email must include @ and .");
+            }
+
             state.email = msg.content;
             state.step = "details";
             return msg.reply("enter event idea/details");
@@ -754,7 +996,12 @@ client.on("messageCreate", async (msg) => {
                 new ButtonBuilder()
                     .setCustomId(`deny_manager_${msg.channel.id}`)
                     .setLabel("Deny")
-                    .setStyle(ButtonStyle.Danger)
+                    .setStyle(ButtonStyle.Danger),
+
+                new ButtonBuilder()
+                    .setCustomId("back")
+                    .setLabel("Back")
+                    .setStyle(ButtonStyle.Secondary)
             );
 
             return msg.channel.send({
@@ -768,27 +1015,39 @@ client.on("messageCreate", async (msg) => {
         }
     }
 
-    // event flow
+    // event flow (Michelle Njoku)
     if (state.type === "event") {
         if (state.step === "title") {
             state.title = msg.content;
             state.step = "date";
-            return msg.reply("enter DATE (YYYY-MM-DD)");
+            return msg.reply("enter DATE, example: 05-12-2026");
         }
 
         if (state.step === "date") {
+            if (!validDate(msg.content)) {
+                return msg.reply("Invalid date. Use MM-DD-YYYY format.");
+            }
+
             state.date = msg.content;
             state.step = "start";
-            return msg.reply("enter START time");
+            return msg.reply("enter START time, example: 07:30 PM");
         }
 
         if (state.step === "start") {
+            if (!validTime(msg.content)) {
+                return msg.reply("Invalid time. Use HH:MM AM/PM format.");
+            }
+
             state.start = msg.content;
             state.step = "end";
-            return msg.reply("enter END time");
+            return msg.reply("enter END time, example: 09:00 PM");
         }
 
         if (state.step === "end") {
+            if (!validTime(msg.content)) {
+                return msg.reply("Invalid time. Use HH:MM AM/PM format.");
+            }
+
             state.end = msg.content;
             state.step = "location";
             return msg.reply("enter LOCATION");
@@ -799,14 +1058,14 @@ client.on("messageCreate", async (msg) => {
             state.step = "online";
             return msg.channel.send({
                 content: "online option?",
-                components: [yesNoRow("event_online")]
+                components: [yesNoRow("event_online"), getBackRow()]
             });
         }
 
         if (state.step === "online_link") {
             const link = msg.content.trim();
 
-            if (!link.startsWith("http")) {
+            if (!validURL(link)) {
                 return msg.reply("enter a valid link starting with http or https");
             }
 
@@ -820,7 +1079,7 @@ client.on("messageCreate", async (msg) => {
             state.step = "flyer";
             return msg.channel.send({
                 content: "do you have a poster/flyer?",
-                components: [yesNoRow("event_flyer")]
+                components: [yesNoRow("event_flyer"), getBackRow()]
             });
         }
 
@@ -842,7 +1101,12 @@ client.on("messageCreate", async (msg) => {
                 new ButtonBuilder()
                     .setCustomId(`restart_event_${msg.channel.id}`)
                     .setLabel("Restart")
-                    .setStyle(ButtonStyle.Danger)
+                    .setStyle(ButtonStyle.Danger),
+
+                new ButtonBuilder()
+                    .setCustomId("back")
+                    .setLabel("Back")
+                    .setStyle(ButtonStyle.Secondary)
             );
 
             state.step = "confirm";
@@ -855,12 +1119,15 @@ client.on("messageCreate", async (msg) => {
     }
 });
 
-// timer stuff
+// timer stuff (Modified by Michelle)
 setInterval(async () => {
     const now = new Date();
 
     for (const eventId in eventStore) {
         const event = eventStore[eventId];
+
+        event.startTime = new Date(`${event.date} ${event.start}`);
+        event.endTime = new Date(`${event.date} ${event.end}`);
 
         // reminder
         if (!event.reminded && now >= new Date(event.startTime.getTime() - 15 * 60000)) {
@@ -875,9 +1142,10 @@ setInterval(async () => {
             }
 
             event.reminded = true;
+            saveData();
         }
 
-        // start notif
+        // start notif (Modified by Michelle)
         if (!event.started && now >= event.startTime) {
             const users = rsvpData[eventId] || [];
 
@@ -890,6 +1158,7 @@ setInterval(async () => {
             }
 
             event.started = true;
+            saveData();
         }
 
         // end event
@@ -918,6 +1187,7 @@ setInterval(async () => {
             }
 
             event.ended = true;
+            saveData();
         }
     }
 }, 60000);
